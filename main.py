@@ -31,11 +31,14 @@ parser.add_argument('--disable-register', '-dr', action='store_true',
                     help='Disable new user registrations')
 parser.add_argument('--disable-guest', '-dg', action='store_true',
                     help='Disable guest login')
+parser.add_argument('--demo', '-dm', action='store_true',
+                    help='Demo mode: 1.5GB memory limit per user, crawls auto-stop at limit')
 args = parser.parse_args()
 
 LOCAL_MODE = args.local
 DISABLE_REGISTER = args.disable_register
 DISABLE_GUEST = args.disable_guest or os.getenv('DISABLE_GUEST', '').lower() in ('true', '1', 'yes')
+DEMO_MODE = args.demo or os.getenv('DEMO_MODE', '').lower() in ('true', '1', 'yes')
 
 app = Flask(__name__, template_folder='web/templates', static_folder='web/static')
 app.secret_key = 'librecrawl-secret-key-change-in-production'  # TODO: Use environment variable in production
@@ -117,6 +120,13 @@ if DISABLE_GUEST:
     print("=" * 60)
     print("GUEST MODE DISABLED")
     print("Guest login is not allowed")
+    print("=" * 60)
+
+if DEMO_MODE:
+    print("=" * 60)
+    print("DEMO MODE ENABLED")
+    print("Memory limit: 1.5GB per user")
+    print("Crawls will auto-stop when limit is reached")
     print("=" * 60)
 
 def get_client_ip():
@@ -666,6 +676,11 @@ def start_crawl():
     except Exception as e:
         print(f"Warning: Could not apply settings: {e}")
 
+    # Enforce demo mode limits
+    if DEMO_MODE:
+        crawler.config['demo_mode'] = True
+        crawler.config['demo_memory_limit_bytes'] = int(1.5 * 1024 * 1024 * 1024)  # 1.5GB
+
     # Pass user_id and session_id for database persistence
     success, message = crawler.start_crawl(url, user_id=user_id, session_id=session_id)
 
@@ -826,8 +841,6 @@ def visualization_data():
 @login_required
 def debug_memory():
     """Debug endpoint showing memory stats for all active crawler instances"""
-    from src.core.memory_profiler import MemoryProfiler
-
     with instances_lock:
         memory_stats = {
             'total_instances': len(crawler_instances),
@@ -838,19 +851,12 @@ def debug_memory():
             crawler = instance_data['crawler']
             stats = crawler.memory_monitor.get_stats()
 
-            # Get accurate data sizes
-            data_sizes = MemoryProfiler.get_crawler_data_size(
-                crawler.crawl_results,
-                crawler.link_manager.all_links if crawler.link_manager else [],
-                crawler.issue_detector.detected_issues if crawler.issue_detector else []
-            )
-
             memory_stats['instances'].append({
                 'session_id': session_id[:8] + '...',  # Truncate for privacy
                 'last_accessed': instance_data['last_accessed'].isoformat(),
                 'urls_crawled': len(crawler.crawl_results),
                 'memory': stats,
-                'data_sizes': data_sizes
+                'data_sizes': crawler.user_memory.get_stats()
             })
 
         return jsonify(memory_stats)
@@ -870,18 +876,11 @@ def debug_memory_profile():
             # Get object breakdown
             breakdown = MemoryProfiler.get_object_memory_breakdown()
 
-            # Get crawler-specific data sizes
-            data_sizes = MemoryProfiler.get_crawler_data_size(
-                crawler.crawl_results,
-                crawler.link_manager.all_links if crawler.link_manager else [],
-                crawler.issue_detector.detected_issues if crawler.issue_detector else []
-            )
-
             profiles.append({
                 'session_id': session_id[:8] + '...',
                 'urls_crawled': len(crawler.crawl_results),
                 'object_breakdown': breakdown,
-                'data_sizes': data_sizes
+                'data_sizes': crawler.user_memory.get_stats()
             })
 
         return jsonify({
@@ -1080,6 +1079,16 @@ def load_crawl_into_session(crawl_id):
         if crawler.issue_detector:
             crawler.issue_detector.detected_issues = issues
 
+        # Rebuild per-user memory tracker for loaded data
+        crawler.user_memory.reset()
+        crawler._demo_limit_reached = False
+        for url_data in urls:
+            crawler.user_memory.track_url(url_data)
+        if links:
+            crawler.user_memory.track_links(links)
+        if issues:
+            crawler.user_memory.track_issues(issues)
+
         # Set Flask session flag for force full refresh
         session['force_full_refresh'] = True
 
@@ -1107,6 +1116,11 @@ def resume_crawl_endpoint(crawl_id):
 
         # Get crawler for this session
         crawler = get_or_create_crawler()
+
+        # Enforce demo mode limits on resumed crawls
+        if DEMO_MODE:
+            crawler.config['demo_mode'] = True
+            crawler.config['demo_memory_limit_bytes'] = int(1.5 * 1024 * 1024 * 1024)
 
         # Resume from database
         success, message = crawler.resume_from_database(crawl_id, user_id=user_id, session_id=session_id)
